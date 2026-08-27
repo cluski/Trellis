@@ -773,13 +773,20 @@ class TurnContextCache {
    private key: string | null = null;
    private timestamp = 0;
    private workflowMsg = "";
+   private skipThisTurn = false;
    private static readonly TTL_MS = 1500;
 
-   get(projectRoot: string, contextKey: string | null, skipThisTurn: boolean = false): { workflowMsg: string } {
+   // Called once per user turn (input event) with the skip decision for that
+   // turn; invalidates the cache so every reader in the cascade
+   // (before_agent_start, context) resolves the same turn state.
+   beginTurn(skipThisTurn: boolean): void {
+      this.skipThisTurn = skipThisTurn;
+      this.key = null;
+   }
+
+   get(projectRoot: string, contextKey: string | null): { workflowMsg: string } {
       const now = Date.now();
-      // skipThisTurn participates in the cache key: a skip turn cached within
-      // the TTL must not leak an empty message into the next (non-skip) turn.
-      const cacheKey = `${projectRoot}:${contextKey ?? ""}:${skipThisTurn ? "skip" : "full"}`;
+      const cacheKey = `${projectRoot}:${contextKey ?? ""}`;
       if (
          this.key === cacheKey &&
          now - this.timestamp < TurnContextCache.TTL_MS
@@ -806,7 +813,7 @@ class TurnContextCache {
       }
 
       // When skip keyword is present, skip workflow state injection this turn
-      this.workflowMsg = skipThisTurn
+      this.workflowMsg = this.skipThisTurn
          ? ""
          : `<workflow-state>\n${workflowBody}\n</workflow-state>\n\n<session-overview>\n${SESSION_OVERVIEW_TEXT}\n</session-overview>`;
 
@@ -998,11 +1005,15 @@ export default function(pi: ExtensionAPI): void {
          if (replacement && !replaced) projectedMessages.push(replacement);
       }
 
-      // Fast path: no task change and no compaction — all persisted context is current.
-      if (!taskContextChanged && lastInjectionTs > lastCompactionTs) return;
-
+      // Resolve the turn state before the fast path: a skip turn must still
+      // run breadcrumb cleanup even when nothing else changed.
       const cached = turnCache.get(projectRoot, contextKey);
-      if (!cached.workflowMsg) {
+      const skipping = !cached.workflowMsg;
+
+      // Fast path: no task change, no compaction, not skipping — all persisted context is current.
+      if (!taskContextChanged && !skipping && lastInjectionTs > lastCompactionTs) return;
+
+      if (skipping) {
          // Skip turn (escape hatch): drop any persisted breadcrumb from an
          // earlier turn so the skip actually takes effect.
          const withoutBreadcrumb = projectedMessages.filter(
@@ -1062,7 +1073,9 @@ export default function(pi: ExtensionAPI): void {
       const skipKeyword = readPromptInjectionSkipKeyword(projectRoot);
       const skipThisTurn = shouldSkipWorkflowState(event.text ?? "", skipKeyword);
 
-      // Pre-warm the cache so before_agent_start and context can use it
-      turnCache.get(projectRoot, contextKey, skipThisTurn);
+      // Record the turn's skip decision and pre-warm the cache so
+      // before_agent_start and context can use it
+      turnCache.beginTurn(skipThisTurn);
+      turnCache.get(projectRoot, contextKey);
    });
 }
