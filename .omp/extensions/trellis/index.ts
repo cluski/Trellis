@@ -723,6 +723,21 @@ function buildTaskContext(projectRoot: string, taskDir: string, agentType?: Agen
 // escape hatch entirely.
 const DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD = "no-trellis";
 
+// PyYAML-compatible resolution of scalars that parse as non-strings: null
+// (empty, ~, null variants), bool (YAML 1.1 set), and numbers. Quoted scalars
+// never reach this check and stay strings.
+function isYamlNonStringScalar(raw: string): boolean {
+   if (raw === "" || raw === "~" || /^(?:null|Null|NULL)$/.test(raw)) return true;
+   if (/^(?:true|True|TRUE|false|False|FALSE|yes|Yes|YES|no|No|NO|on|On|ON|off|Off|OFF)$/.test(raw)) return true;
+   // PyYAML int resolver: binary/octal/decimal/hex; leading-zero decimals are not ints.
+   if (/^[-+]?(?:0[bB][01_]+|0[0-7_]+|0[xX][0-9a-fA-F_]+|[1-9][\d_]*|0)$/.test(raw)) return true;
+   // PyYAML float resolver: requires a dot and a signed exponent ("1.5e+3",
+   // not "1.5e3" — the latter stays a string in PyYAML).
+   return /^[-+]?(?:\d[\d_]*\.[\d_]*|\.[\d_]+)(?:[eE][-+]\d+)?$/.test(raw) ||
+      /^[-+]?\.(?:inf|Inf|INF)$/.test(raw) ||
+      /^\.(?:nan|NaN|NAN)$/.test(raw);
+}
+
 function readPromptInjectionSkipKeyword(projectRoot: string): string {
    let config = "";
    try { config = readFileSync(join(projectRoot, ".trellis", "config.yaml"), "utf-8"); } catch { return DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD; }
@@ -743,7 +758,16 @@ function readPromptInjectionSkipKeyword(projectRoot: string): string {
       if (indent <= sectionIndent) break;
       const match = trimmed.match(/^skip_keyword\s*:\s*(.*)$/);
       if (!match) continue;
-      return unquoteYaml(stripInlineComment(match[1]!).trim()).trim();
+      const rawValue = stripInlineComment(match[1]!).trim();
+      const unquoted = unquoteYaml(rawValue);
+      // Preserve YAML scalar typing, mirroring _resolve_skip_keyword's
+      // isinstance(raw, str) check: a bare non-string scalar (bool/null/
+      // number, including an empty value) falls back to the default, while
+      // quoted scalars — including an explicit "" — stay strings.
+      if (unquoted === rawValue && isYamlNonStringScalar(rawValue)) {
+         return DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD;
+      }
+      return unquoted.trim();
    }
    return DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD;
 }
