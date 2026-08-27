@@ -718,11 +718,14 @@ function buildTaskContext(projectRoot: string, taskDir: string, agentType?: Agen
 // Prompt injection config (escape hatch)
 // ---------------------------------------------------------------------------
 
-// Unset config (or missing config.yaml) disables the escape hatch; only an
-// explicit prompt_injection.skip_keyword enables per-turn skipping.
+// Mirrors DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD in inject-workflow-state.py:
+// the skip keyword defaults to "no-trellis"; an explicit "" disables the
+// escape hatch entirely.
+const DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD = "no-trellis";
+
 function readPromptInjectionSkipKeyword(projectRoot: string): string {
    let config = "";
-   try { config = readFileSync(join(projectRoot, ".trellis", "config.yaml"), "utf-8"); } catch { return ""; }
+   try { config = readFileSync(join(projectRoot, ".trellis", "config.yaml"), "utf-8"); } catch { return DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD; }
 
    let inSection = false;
    let sectionIndent = -1;
@@ -742,12 +745,12 @@ function readPromptInjectionSkipKeyword(projectRoot: string): string {
       if (!match) continue;
       return unquoteYaml(stripInlineComment(match[1]!).trim()).trim();
    }
-   return "";
+   return DEFAULT_PROMPT_INJECTION_SKIP_KEYWORD;
 }
 
-// Hyphen counts as a word char so "no-trellisx" / "xno-trellis" /
-// "foo-no-trellis" don't match, but punctuation/whitespace boundaries do.
-// Empty keyword (unset config) never matches.
+// Mirrors prompt_has_skip_keyword() in inject-workflow-state.py: hyphen counts
+// as a word char so "no-trellisx" / "xno-trellis" / "foo-no-trellis" don't
+// match, but punctuation/whitespace boundaries do. Empty keyword never matches.
 function shouldSkipWorkflowState(
    userInput: string,
    skipKeyword: string,
