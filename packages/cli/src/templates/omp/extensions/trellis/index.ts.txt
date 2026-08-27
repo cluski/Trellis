@@ -715,6 +715,50 @@ function buildTaskContext(projectRoot: string, taskDir: string, agentType?: Agen
 }
 
 // ---------------------------------------------------------------------------
+// Prompt injection config (escape hatch)
+// ---------------------------------------------------------------------------
+
+// Unset config (or missing config.yaml) disables the escape hatch; only an
+// explicit prompt_injection.skip_keyword enables per-turn skipping.
+function readPromptInjectionSkipKeyword(projectRoot: string): string {
+   let config = "";
+   try { config = readFileSync(join(projectRoot, ".trellis", "config.yaml"), "utf-8"); } catch { return ""; }
+
+   let inSection = false;
+   let sectionIndent = -1;
+   for (const rawLine of config.split(/\r?\n/)) {
+      const trimmed = rawLine.trim();
+      if (!inSection) {
+         if (/^prompt_injection\s*:\s*(#.*)?$/.test(trimmed)) {
+            inSection = true;
+            sectionIndent = rawLine.length - rawLine.trimStart().length;
+         }
+         continue;
+      }
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const indent = rawLine.length - rawLine.trimStart().length;
+      if (indent <= sectionIndent) break;
+      const match = trimmed.match(/^skip_keyword\s*:\s*(.*)$/);
+      if (!match) continue;
+      return unquoteYaml(stripInlineComment(match[1]!).trim()).trim();
+   }
+   return "";
+}
+
+// Hyphen counts as a word char so "no-trellisx" / "xno-trellis" /
+// "foo-no-trellis" don't match, but punctuation/whitespace boundaries do.
+// Empty keyword (unset config) never matches.
+function shouldSkipWorkflowState(
+   userInput: string,
+   skipKeyword: string,
+): boolean {
+   if (!skipKeyword) return false;
+   const escapedKeyword = skipKeyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+   const pattern = new RegExp(`(?<![\\w-])${escapedKeyword}(?![\\w-])`, "i");
+   return pattern.test(userInput);
+}
+
+// ---------------------------------------------------------------------------
 // Per-turn cache — prevents redundant workflow-state resolution within a
 // single event cascade (input, before_agent_start, and context fire closely)
 // ---------------------------------------------------------------------------
@@ -728,9 +772,11 @@ class TurnContextCache {
    private workflowMsg = "";
    private static readonly TTL_MS = 1500;
 
-   get(projectRoot: string, contextKey: string | null): { workflowMsg: string } {
+   get(projectRoot: string, contextKey: string | null, skipThisTurn: boolean = false): { workflowMsg: string } {
       const now = Date.now();
-      const cacheKey = `${projectRoot}:${contextKey ?? ""}`;
+      // skipThisTurn participates in the cache key: a skip turn cached within
+      // the TTL must not leak an empty message into the next (non-skip) turn.
+      const cacheKey = `${projectRoot}:${contextKey ?? ""}:${skipThisTurn ? "skip" : "full"}`;
       if (
          this.key === cacheKey &&
          now - this.timestamp < TurnContextCache.TTL_MS
@@ -756,7 +802,10 @@ class TurnContextCache {
          workflowBody = "Refer to workflow.md for current step.";
       }
 
-      this.workflowMsg = `<workflow-state>\n${workflowBody}\n</workflow-state>\n\n<session-overview>\n${SESSION_OVERVIEW_TEXT}\n</session-overview>`;
+      // When skip keyword is present, skip workflow state injection this turn
+      this.workflowMsg = skipThisTurn
+         ? ""
+         : `<workflow-state>\n${workflowBody}\n</workflow-state>\n\n<session-overview>\n${SESSION_OVERVIEW_TEXT}\n</session-overview>`;
 
       this.key = cacheKey;
       this.timestamp = now;
@@ -902,6 +951,9 @@ export default function(pi: ExtensionAPI): void {
       const cached = turnCache.get(projectRoot, contextKey);
       lastInjectionTs = Date.now();
 
+      // Skip turn: inject nothing (escape hatch)
+      if (!cached.workflowMsg) return;
+
       return {
          message: {
             customType: "trellis-workflow-state",
@@ -947,7 +999,16 @@ export default function(pi: ExtensionAPI): void {
       if (!taskContextChanged && lastInjectionTs > lastCompactionTs) return;
 
       const cached = turnCache.get(projectRoot, contextKey);
-      if (!cached.workflowMsg) return taskContextChanged ? { messages: projectedMessages } : undefined;
+      if (!cached.workflowMsg) {
+         // Skip turn (escape hatch): drop any persisted breadcrumb from an
+         // earlier turn so the skip actually takes effect.
+         const withoutBreadcrumb = projectedMessages.filter(
+            (message) => !(message.role === "custom" && message.customType === "trellis-workflow-state"),
+         );
+         if (withoutBreadcrumb.length === projectedMessages.length && !taskContextChanged) return;
+         lastInjectionTs = Date.now();
+         return { messages: withoutBreadcrumb };
+      }
 
       // Post-compaction: reverse-scan to confirm absence before injecting
       for (let i = projectedMessages.length - 1; i >= 0; i--) {
@@ -986,14 +1047,19 @@ export default function(pi: ExtensionAPI): void {
       };
    });
 
-   pi.on("input", async (_event, ctx) => {
+   pi.on("input", async (event, ctx) => {
       if (!projectRoot) {
          projectRoot = findProjectRoot(ctx.cwd);
       }
       // Resolve projectRoot on first input if session_start missed it
       if (!projectRoot) return;
       const contextKey = rememberContextKey(ctx);
+
+      // Check if this turn should skip workflow state injection
+      const skipKeyword = readPromptInjectionSkipKeyword(projectRoot);
+      const skipThisTurn = shouldSkipWorkflowState(event.text ?? "", skipKeyword);
+
       // Pre-warm the cache so before_agent_start and context can use it
-      turnCache.get(projectRoot, contextKey);
+      turnCache.get(projectRoot, contextKey, skipThisTurn);
    });
 }
